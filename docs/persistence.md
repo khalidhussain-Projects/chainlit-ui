@@ -35,19 +35,37 @@ The async driver matters because `SQLAlchemySession` is async, and the runner aw
 
 ## 4. `session_id` — how we identify a thread
 
-The session id is a **stable per-conversation key**. Source order (first non-empty wins):
-
-1. `message.thread_id` — Chainlit's per-conversation thread id; flips when the user clicks **New Chat**.
-2. `cl.user_session.id` — per-tab fallback so a threadless reload still gets persistence.
-3. **Never** generate a random id at this layer — that would erase history on every reload.
-
-The factory:
+The session id is a **stable per-(user, thread) key**, composed at session-build time:
 
 ```python
 def _make_session(thread_id: str | None) -> SQLAlchemySession:
-    sid = thread_id or cl.user_session.get("id") or "default"
+    user = cl.user_session.get("user")
+    user_id = user.identifier if user is not None else "anon"
+    tid = thread_id or "default"
+    sid = f"user:{user_id}:thread:{tid}"
     return SQLAlchemySession(session_id=sid, engine=_get_engine(), create_tables=True)
 ```
+
+Three things this buys us:
+
+1. **Cross-device history for a returning user.** Because `cl.user_session.get("user")` returns a `chainlit.User` whose `.identifier` is set by `@cl.password_auth_callback` (see §7), the same login on a second browser resolves to the same `user:…:thread:…` key — so the new device sees the old threads.
+2. **Isolation between users on the same machine.** Two people logging in as `demo` and `alice` get distinct `user:demo:thread:…` and `user:alice:thread:…` keys. The agent's history for one never bleeds into the other's session.
+3. **Greppable history rows.** The `user:<id>:thread:<id>` shape is searchable in the `agent_history` table — `SELECT session_id, count(*) FROM agent_history GROUP BY session_id` returns cleanly labeled rows.
+
+The `anon:` fallback only fires if `cl.user_session.get("user")` returns `None` — which is rare when password auth is on, but it keeps an in-flight session during a deploy from crashing if the auth handshake hasn't completed yet. It also keeps any pre-auth rows (if you had history from before turning auth on) from being merged into a real user's session.
+
+### Before/after cutover
+
+If you turn auth on after history already exists, the old `session_id` values (bare `thread_id`s) won't match the new `user:<id>:thread:<id>` keys. Two options:
+
+- **Fresh start** (recommended for a demo) — let the old rows sit, ignore them. New messages go into the new keys.
+- **Continuity** — one-shot SQL in the Neon editor:
+  ```sql
+  UPDATE agent_history
+     SET session_id = 'user:demo:thread:' || session_id
+   WHERE session_id NOT LIKE 'user:%';
+  ```
+  This rebinds every anonymous row to the `demo` user. Run it once, then redeploy.
 
 `create_tables=True` is idempotent — safe to leave on in dev and small Render instances.
 
@@ -68,6 +86,16 @@ The engine itself is built once per worker process by `@lru_cache(maxsize=1)`-wr
 OPENAI_API_KEY=...
 
 DATABASE_URL=postgresql+asyncpg://user:password@host/db?sslmode=require&channel_binding=require
+
+# Required for password auth (see §7). Generate with:
+#   python -c "import secrets; print(secrets.token_urlsafe(48))"
+CHAINLIT_AUTH_SECRET=...
+
+# Passwords for the demo accounts in main.py's _DEMO_USERS dict.
+# Defaults to "demo" / "alice123" if unset — set real values on Render.
+CHAINLIT_AUTH_PASSWORD_DEMO=demo
+CHAINLIT_AUTH_PASSWORD_ALICE=alice123
+
 # (optional) SESSION_ENCRYPTION_KEY=<32-byte url-safe base64>  # only if we enable EncryptedSession
 ```
 
@@ -102,6 +130,14 @@ The engine uses `poolclass=NullPool` so each `SQLAlchemySession` borrows a conne
 ## 7. The data layer decision
 
 `@cl.data_layer` returns `None`. That's deliberate: Chainlit's default `ChainlitDataLayer` would auto-initialize its own `Thread`/`Step`/`Element` schema on top of `DATABASE_URL`, but (a) its schema expectations don't match what `openai-agents` writes, and (b) it passes SSL query params that asyncpg rejects. Returning `None` opts us out of Chainlit's persistence entirely; the only persistence in this app is the `SQLAlchemySession` for agent memory. `db/schema.sql` is kept on disk for reference (it's the schema Chainlit's data layer would have used) but it is **not** applied at boot.
+
+## 7a. Authentication
+
+`@cl.password_auth_callback` (`auth_callback` in `main.py`) is the only auth in this app. It reads passwords from env vars (`CHAINLIT_AUTH_PASSWORD_DEMO`, `CHAINLIT_AUTH_PASSWORD_ALICE`) and returns a `cl.User(identifier=username, display_name=username.title())` on success, `None` on failure. With this callback registered, Chainlit shows a login form at `/login` before the chat UI is reachable.
+
+The reason this matters for persistence: `cl.user_session.get("user")` returns the logged-in `User` object, and `user.identifier` is what `_make_session` uses to compose the `session_id`. Without auth, that key falls back to Chainlit's per-tab `user_session.id` — which means a second browser tab gets a *different* history from the first tab of the same user. With auth on, the key is stable across tabs, browsers, and devices.
+
+Adding more users is a one-line change to `_DEMO_USERS`. Beyond a handful, swap the dict for a DB lookup (hashed passwords, ideally `bcrypt` or `argon2` — and use `hmac.compare_digest` instead of `==` to avoid timing leaks).
 
 ## 8. Out of scope (for this round)
 
@@ -143,6 +179,9 @@ Set these in the **Environment** tab of the Web Service:
 |---|---|---|
 | `OPENAI_API_KEY` | Your OpenAI key | Same value as in your local `.env`. Mark as secret. |
 | `DATABASE_URL` | Neon connection string for the branch you want this service to use | Comes from **Neon → Project → Connection Details**, with `pooled` toggled ON for serverless, OFF for long-lived. `?sslmode=require&channel_binding=require` is expected and stripped by `_build_engine_url()`. Mark as secret. |
+| `CHAINLIT_AUTH_SECRET` | Long random string | **Required.** Generate with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. Used by Chainlit to sign JWT session cookies. The first login attempt will throw if this is unset. **Changing this value logs out every active session** — rotate deliberately. Mark as secret. |
+| `CHAINLIT_AUTH_PASSWORD_DEMO` | Password for the `demo` account | Defaults to `"demo"` if unset, but set a real value on Render. Mark as secret. |
+| `CHAINLIT_AUTH_PASSWORD_ALICE` | Password for the `alice` account | Defaults to `"alice123"` if unset, but set a real value on Render. Mark as secret. |
 | `RENDER` | (auto-set) | Render injects `RENDER=true` on every service. Our code uses this to decide whether to hard-fail on missing `DATABASE_URL`. Don't set it manually. |
 | `PYTHON_VERSION` | `3.13` | Optional but speeds up detection. |
 
@@ -202,3 +241,7 @@ The same `main.py` runs in both environments. Differences are only the env vars:
   - Added `_build_engine_url()` which calls `make_url(...).difference_update_query(["sslmode", "channel_binding", "sslcert", "sslkey", "sslrootcert"])`. Fixes the latent `sslmode can only be specified once` error that would have fired against any Neon URL once asyncpg received both the query string and `connect_args["ssl"]=True`.
   - Added a `RENDER` env-var guard in `_resolve_database_url()`: if `DATABASE_URL` is unset on Render, raise `RuntimeError` instead of silently falling back to ephemeral-disk SQLite.
   - Refreshed this doc to match (DB is Neon, not Render PG; `chainlit data create` is no longer required because `get_data_layer() -> None`; `db/schema.sql` is kept for reference only).
+- **2026-09-03 — password auth + per-user session keys.**
+  - Added `@cl.password_auth_callback` (`auth_callback`) backed by a 2-entry `_DEMO_USERS` dict keyed off `CHAINLIT_AUTH_PASSWORD_DEMO` / `CHAINLIT_AUTH_PASSWORD_ALICE` env vars.
+  - Rewrote `_make_session` to compose `session_id = f"user:{user.identifier}:thread:{thread_id}"` instead of using Chainlit's per-tab `user_session.id`. A returning user now sees the same threads across browsers and devices; different users on the same machine stay isolated.
+  - Documented the cutover in §4 (with a one-shot SQL to rebind pre-auth rows to the `demo` user if continuity matters) and the new env vars in §10.3 (`CHAINLIT_AUTH_SECRET` is required).

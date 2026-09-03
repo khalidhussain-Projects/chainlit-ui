@@ -77,11 +77,51 @@ def _get_engine():
 
 
 def _make_session(thread_id: str | None) -> SQLAlchemySession:
-    """Build a SQLAlchemySession keyed on a stable per-thread id, reusing the
-    shared engine from `_get_engine()`.
+    """Build a SQLAlchemySession keyed on (user, thread).
+
+    With password auth enabled, `cl.user_session.get("user")` returns a
+    `chainlit.User` whose `.identifier` is the login name. Composing the key
+    as `user:<identifier>:thread:<thread_id>` means a returning user sees
+    their own threads from any device, while different users on the same
+    machine stay isolated from each other.
+
+    The `anon:` prefix on the fallback path keeps pre-auth rows (if any
+    survived the cutover) distinct from real-user rows, so no one's old
+    anonymous history accidentally leaks into a logged-in session. With
+    auth on this branch is rarely hit — every WS connection has a user
+    once the auth handshake completes — but it keeps an in-flight session
+    during a deploy from crashing.
     """
-    sid = thread_id or cl.user_session.get("id") or "default"
+    user = cl.user_session.get("user")
+    user_id = user.identifier if user is not None else "anon"
+    tid = thread_id or "default"
+    sid = f"user:{user_id}:thread:{tid}"
     return SQLAlchemySession(session_id=sid, engine=_get_engine(), create_tables=True)
+
+
+# Demo accounts. Read from env so passwords can be rotated without a code
+# change and so production secrets stay out of git. For a private demo, a
+# 2-3 entry dict is enough; swap for a DB lookup when more than a handful
+# of users need access.
+_DEMO_USERS: dict[str, str] = {
+    "demo": os.environ.get("CHAINLIT_AUTH_PASSWORD_DEMO", "demo"),
+    "alice": os.environ.get("CHAINLIT_AUTH_PASSWORD_ALICE", "alice123"),
+}
+
+
+@cl.password_auth_callback
+async def auth_callback(username: str, password: str) -> cl.User | None:
+    """Validate (username, password) against the demo accounts dict.
+
+    Returns a User on success, None on failure. Chainlit calls this on every
+    login attempt. Constant-time comparison isn't worth the dep for a demo
+    with a 2-entry dict, but `hmac.compare_digest` would be the upgrade path
+    when the user count grows past ~5.
+    """
+    expected = _DEMO_USERS.get(username)
+    if expected is not None and expected == password:
+        return cl.User(identifier=username, display_name=username.title())
+    return None
 
 
 @cl.data_layer
@@ -104,10 +144,11 @@ def greeting_function(name: str) -> str:
 
 
 greeting_agent = Agent(
-    name="Greeting Agent",
+    name="Nova",
     tools=[greeting_function],
     instructions=(
-        "You are a helpful assistant and you can use your tools when required"
+        "You are Nova, a friendly AI assistant. Introduce yourself as Nova if asked. "
+        "Use your tools when required."
     ),
 )
 

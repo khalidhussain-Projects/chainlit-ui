@@ -1,0 +1,130 @@
+/* -------------------------------------------------------------------------
+ * theme.css — navy + cyan robotic-humanoid palette for Chainlit
+ *
+ * Chainlit ships its own :root custom properties in HSL-channel format
+ * (e.g. --primary: 340 92% 52% — hot pink) and writes `color: hsl(var(--primary))`
+ * in its bundled CSS. We override the same names here with new HSL channels,
+ * so the rest of the UI keeps working without us having to fight any selectors.
+ *
+ * Selector strategy:
+ *   :root                  → default (light) values, applied unless the host
+ *                            stamps data-theme="dark" on the root.
+ *   :root[data-theme="dark"] → dark values, take precedence over the default.
+ *
+ * Toggling the theme in the UI flips the data-theme attribute; both palettes
+ * are defined in this one file.
+ * ------------------------------------------------------------------------- */
+
+:root {
+  /* Light mode — pale navy background, same blue accent. */
+  --background: 210 50% 96%;
+  --foreground: 222 47% 11%;
+  --card: 0 0% 100%;
+  --card-foreground: 222 47% 11%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 222 47% 11%;
+  --primary: 217 91% 50%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 210 40% 96%;
+  --secondary-foreground: 222 47% 11%;
+  --muted: 210 40% 96%;
+  --muted-foreground: 215 16% 47%;
+  --accent: 217 91% 50%;
+  --accent-foreground: 0 0% 100%;
+  --destructive: 0 84% 60%;
+  --destructive-foreground: 210 40% 96%;
+  --border: 214 32% 91%;
+  --input: 214 32% 91%;
+  --ring: 217 91% 50%;
+  --sidebar-background: 210 50% 98%;
+  --sidebar-foreground: 222 47% 11%;
+  --sidebar-primary: 217 91% 50%;
+  --sidebar-primary-foreground: 0 0% 100%;
+  --sidebar-accent: 210 40% 96%;
+  --sidebar-accent-foreground: 222 47% 11%;
+  --sidebar-border: 214 32% 91%;
+}
+
+:root[data-theme="dark"] {
+  /* Dark mode — deep navy background, electric-blue + cyan accents. */
+  --background: 222 47% 7%;
+  --foreground: 210 40% 96%;
+  --card: 222 47% 11%;
+  --card-foreground: 210 40% 96%;
+  --popover: 222 47% 11%;
+  --popover-foreground: 210 40% 96%;
+  --primary: 217 91% 60%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 217 33% 18%;
+  --secondary-foreground: 210 40% 96%;
+  --muted: 217 33% 18%;
+  --muted-foreground: 215 20% 65%;
+  --accent: 186 100% 50%;
+  --accent-foreground: 222 47% 11%;
+  --destructive: 0 84% 60%;
+  --destructive-foreground: 210 40% 96%;
+  --border: 217 33% 20%;
+  --input: 217 33% 20%;
+  --ring: 217 91% 60%;
+  --sidebar-background: 222 47% 5%;
+  --sidebar-foreground: 210 40% 96%;
+  --sidebar-primary: 217 91% 60%;
+  --sidebar-primary-foreground: 0 0% 100%;
+  --sidebar-accent: 217 33% 14%;
+  --sidebar-accent-foreground: 210 40% 96%;
+  --sidebar-border: 217 33% 20%;
+}
+
+/* -------------------------------------------------------------------------
+ * "Robotic humanoid" feel — small additions on top of the palette.
+ * Each is self-contained and easy to delete if it's not your taste.
+ * ------------------------------------------------------------------------- */
+
+/* Cyan focus glow on every focusable element. Sits on top of Chainlit's own
+   outline so we get a uniform tech-UI feel across inputs, buttons, links. */
+*:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px hsl(186 100% 50% / 0.4);
+  border-radius: 4px;
+}
+
+/* Tabular numerics in code/monospace so timestamps, token counts, and any
+   embedded numbers line up like an instrument panel. */
+code, kbd, pre, samp {
+  font-feature-settings: "tnum" 1, "cv11" 1;
+}
+
+/* Subtle animated grid behind the welcome screen — a hint of the
+   "robotic" / sci-fi vibe without being noisy. ~3% opacity, 30s loop.
+   Removed automatically on prefers-reduced-motion. */
+@keyframes theme-grid-drift {
+  0%   { background-position: 0 0, 0 0; }
+  100% { background-position: 60px 60px, 60px 60px; }
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image:
+    linear-gradient(hsl(217 91% 60% / 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, hsl(217 91% 60% / 0.04) 1px, transparent 1px);
+  background-size: 60px 60px;
+  animation: theme-grid-drift 30s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body::before { animation: none; }
+}
+
+/* Slightly stronger scrollbar in dark mode so it doesn't disappear. */
+:root[data-theme="dark"] ::-webkit-scrollbar { width: 10px; height: 10px; }
+:root[data-theme="dark"] ::-webkit-scrollbar-thumb {
+  background: hsl(217 33% 25%);
+  border-radius: 6px;
+}
+:root[data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
+  background: hsl(217 33% 35%);
+}
