@@ -3,6 +3,7 @@ import chainlit as cl
 from agents import Agent, Runner, function_tool
 from openai.types.responses import ResponseTextDeltaEvent
 import os
+from functools import lru_cache
 from agents.extensions.memory.sqlalchemy_session import SQLAlchemySession
 
 # Load the environment variables from the .env file
@@ -13,10 +14,18 @@ def _resolve_database_url() -> str:
     """Pick the right DB URL for the current environment.
 
     Local dev:  falls back to sqlite+aiosqlite if DATABASE_URL is unset.
-    Render:     normalizes postgres:// and postgresql:// to the asyncpg form.
+    Render:     normalizes postgres:// and postgresql:// to the asyncpg form,
+                and raises (rather than silently degrading to SQLite) if
+                DATABASE_URL is missing — Render's disk is ephemeral, so a
+                SQLite file would be wiped on every redeploy.
     """
     url = os.getenv("DATABASE_URL")
     if not url:
+        if os.getenv("RENDER"):  # Render sets this on every service
+            raise RuntimeError(
+                "DATABASE_URL is required on Render — the disk is ephemeral, "
+                "so a SQLite fallback would lose history on every redeploy."
+            )
         return "sqlite+aiosqlite:///./agents.db"
     if url.startswith("postgres://"):
         return url.replace("postgres://", "postgresql+asyncpg://", 1)
@@ -25,13 +34,67 @@ def _resolve_database_url() -> str:
     return url
 
 
-DATABASE_URL = _resolve_database_url()
+def _build_engine_url() -> str:
+    """Resolve DATABASE_URL and strip SSL-related query keys before asyncpg
+    sees them. Neon (and most managed Postgres providers) append
+    `?sslmode=require&channel_binding=require` to the URL; passing those
+    through to asyncpg while also setting `ssl=True` in connect_args causes a
+    "sslmode value ... can only be specified once" error.
+    """
+    from sqlalchemy.engine.url import make_url
+
+    url = make_url(_resolve_database_url()).difference_update_query(
+        ["sslmode", "channel_binding", "sslcert", "sslkey", "sslrootcert"]
+    )
+    return url.render_as_string(hide_password=False)
+
+
+@lru_cache(maxsize=1)
+def _get_engine():
+    """Build the async SQLAlchemy engine exactly once per worker process.
+
+    Cached so that we don't open a fresh connection pool on every incoming
+    message. Uses NullPool so each SQLAlchemySession borrows a connection
+    for the duration of one `add_items`/`get_items` call and returns it,
+    rather than holding idle connections across requests — important on
+    managed Postgres (Neon) where connection counts are capped.
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    # statement_cache_size=0 / prepared_statement_cache_size=0 are required
+    # when the database sits behind PgBouncer-style transaction pooling
+    # (Neon's default), which does not support server-side prepared statements.
+    return create_async_engine(
+        _build_engine_url(),
+        connect_args={
+            "statement_cache_size": 0,
+            "prepared_statement_cache_size": 0,
+            "ssl": True,
+        },
+        poolclass=NullPool,
+    )
 
 
 def _make_session(thread_id: str | None) -> SQLAlchemySession:
-    """Build a SQLAlchemySession keyed on a stable per-thread id."""
+    """Build a SQLAlchemySession keyed on a stable per-thread id, reusing the
+    shared engine from `_get_engine()`.
+    """
     sid = thread_id or cl.user_session.get("id") or "default"
-    return SQLAlchemySession(session_id=sid, url=DATABASE_URL, create_tables=True)
+    return SQLAlchemySession(session_id=sid, engine=_get_engine(), create_tables=True)
+
+
+@cl.data_layer
+def get_data_layer():
+    """Disable Chainlit's built-in data layer.
+
+    Chainlit's default ChainlitDataLayer auto-initializes when DATABASE_URL
+    is set, but its schema expectations don't match the openai-agents SDK
+    and it tries to use sslmode query params that asyncpg rejects. Returning
+    None here opts us out, while still letting our SQLAlchemySession use
+    DATABASE_URL for agent memory (with SSL keys stripped by _build_engine_url).
+    """
+    return None
 
 
 @function_tool
@@ -67,7 +130,7 @@ async def main(message: cl.Message):
     session = _make_session(message.thread_id)
 
     try:
-        result = await Runner.run_streamed(
+        result = Runner.run_streamed(
             starting_agent=greeting_agent,
             input=message.content,
             session=session,
